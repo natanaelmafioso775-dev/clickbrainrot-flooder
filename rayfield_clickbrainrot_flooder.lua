@@ -167,7 +167,7 @@ local Rebirths = require(Modules and Modules:FindFirstChild("Rebirths"))
 local AutoBuyEnabled = false
 local AutoBuyMinCash = 1000
 local PlayerData = {
-    Cash = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Cash")
+    Cash = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Cash"),
     Rebirths = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Rebirths")
 }
 
