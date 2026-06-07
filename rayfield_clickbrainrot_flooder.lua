@@ -86,7 +86,11 @@ end
 
 -- Heartbeat: processa a fila a cada frame (sem travar)
 RunService.Heartbeat:Connect(function(dt)
-    if Queue.mode == "idle" then return end
+    if Queue.mode == "idle" then
+        if AutoBuyEnabled then
+            tryAutoBuy()
+        end
+        return end
 
     -- Modo: enviando chamadas
     if Queue.mode == "sending" then
@@ -151,6 +155,86 @@ RunService.Heartbeat:Connect(function(dt)
         return
     end
 end)
+
+-- ===================== AUTO-BUY SYSTEM =====================
+local Modules = RS:FindFirstChild("Modules")
+local Upgrades = Modules and require(Modules:FindFirstChild("Upgrades"))
+local SharedFunctions = Modules and require(Modules:FindFirstChild("SharedFunctions"))
+local BuyUpgrade = RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("BuyUpgrade")
+local CharacterData = Modules and require(Modules:FindFirstChild("CharacterData"))
+local Rebirths = require(Modules and Modules:FindFirstChild("Rebirths"))
+
+local AutoBuyEnabled = false
+local AutoBuyMinCash = 1000
+local PlayerData = {
+    Cash = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Cash")
+    Rebirths = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Rebirths")
+}
+
+local function getCurrentMultiplier()
+    local mult = 1
+    if Rebirths and PlayerData.Rebirths then
+        local reb = Rebirths[PlayerData.Rebirths.Value]
+        if reb and reb.Unlocks and reb.Unlocks.Multiplier then
+            mult = mult * reb.Unlocks.Multiplier
+        end
+    end
+    if CharacterData and PlayerData.Cash then
+        local char = CharacterData.Characters[PlayerData.Cash]
+        if char and char.Attributes then
+            local cm = char.Attributes["Cash Multiplier"]
+            if cm then mult = mult * cm end
+        end
+    end
+    return mult
+end
+
+local function getUpgradeDiscount()
+    if not CharacterData or not PlayerData.Cash then return 0 end
+    local char = CharacterData.Characters[PlayerData.Cash]
+    local attrs = char and char.Attributes
+    if not attrs then return 0 end
+    local disc = attrs["Upgrade Costs"]
+    return typeof(disc) == "number" and disc or 0
+end
+
+local function getUpgradeCost(upgradeName, level)
+    if not Upgrades or not Upgrades[upgradeName] then return math.huge end
+    local upg = Upgrades[upgradeName]
+    local cost = (upg.baseCost or 1) * (upg.CostGrowth or 1) ^ level
+    local disc = getUpgradeDiscount()
+    if disc > 0 then cost = cost * (1 - disc / 100) end
+    return math.floor(math.max(1, cost))
+end
+
+local function getPlayerLevels()
+    local levels = {}
+    if not PlayerData.Cash then return levels end
+    local guiEvents = Modules and require(Modules:FindFirstChild("GuiEvents"))
+    return levels
+end
+
+local function tryAutoBuy()
+    if not AutoBuyEnabled or not BuyUpgrade or not Upgrades or not PlayerData.Cash then return end
+    local cash = PlayerData.Cash.Value
+    local currentMult = getCurrentMultiplier()
+    for upgradeName, upg in pairs(Upgrades) do
+        if upg.Rebirth and PlayerData.Rebirths and PlayerData.Rebirths.Value >= upg.Rebirth then
+            local level = 0
+            local cost = getUpgradeCost(upgradeName, level)
+            if cash >= cost then
+                local ok, result = pcall(function()
+                    return BuyUpgrade:InvokeServer(upgradeName, 1)
+                end)
+                if ok and result and result.success then
+                    cash = cash - (result.newPrice or cost)
+                    PlayerData.Cash.Value = cash
+                    return
+                end
+            end
+        end
+    end
+end
 
 -- ===================== FUNCAO PUBLICA: SEND BURST =====================
 
@@ -281,6 +365,29 @@ TabFlood:CreateToggle({
         else
             StatusMode = "Sequencial"
         end
+    end,
+})
+
+local SecAutoBuy = TabFlood:CreateSection("Auto-Buy")
+
+TabFlood:CreateToggle({
+    Name = "Auto-Buy Upgrades",
+    CurrentValue = false,
+    Flag = "TglAutoBuy",
+    Callback = function(v)
+        AutoBuyEnabled = v
+    end,
+})
+
+TabFlood:CreateSlider({
+    Name = "Min Cash para Auto-Buy",
+    Range = {0, 100000},
+    Increment = 100,
+    Suffix = "$",
+    CurrentValue = 1000,
+    Flag = "SldMinCash",
+    Callback = function(v)
+        AutoBuyMinCash = math.floor(v)
     end,
 })
 
