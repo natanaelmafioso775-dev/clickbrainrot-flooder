@@ -1,8 +1,9 @@
 --[[
     ========================================================================
-    ClickBrainrot Flooder v2 - Engine Otimizada (Zero Lag)
+    ClickBrainrot Flooder v3 + Auto Buy Upgrades
     ========================================================================
     Envia multiplas chamadas do remote ClickBrainrot SEM travar o jogo.
+    + Sistema automatico de compra de upgrades.
 
     Diferenciais:
       - Usa RunService.Heartbeat (sincronizado com o framerate)
@@ -11,6 +12,7 @@
       - Sem notificacoes durante rajada (zero overhead)
       - Coleta de lixo manual a cada ciclo
       - Modo sleep quando minimizado / sem foco
+      - Auto Buy: compra upgrades automaticamente quando tem cash
 
     Remote: ReplicatedStorage.Remotes.ClickBrainrot
     Args: { [1] = 1 }
@@ -21,7 +23,6 @@
 local RS          = game:GetService("ReplicatedStorage")
 local RunService  = game:GetService("RunService")
 local Player      = game:GetService("Players").LocalPlayer
-local UserInput   = game:GetService("UserInputService")
 
 -- Resolve o remote uma unica vez (cache permanente)
 local ClickBrainrot = RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("ClickBrainrot")
@@ -37,31 +38,155 @@ local function FireOnce()
     pcall(ClickBrainrot.FireServer, ClickBrainrot, unpack(ARGS))
 end
 
--- ===================== ESTADO GLOBAL =====================
-local Times        = 10      -- quantas chamadas por rajada
-local Speed        = 0.05    -- delay entre chamadas (segundos)
-local BurstDelay   = 1.0     -- delay entre rajadas no loop
-local Looping      = false   -- loop automatico ativo?
-local Running      = false   -- alguma operacao em andamento?
+-- ===================== UPGRADE SYSTEM (DECOMPILED) =====================
+local Modules = RS:WaitForChild("Modules")
+local Upgrades = require(Modules:WaitForChild("Upgrades"))
+local Rebirths = require(Modules:WaitForChild("Rebirths"))
+local SharedFunctions = require(Modules:WaitForChild("SharedFunctions"))
+local Remotes = RS:WaitForChild("Remotes")
+local BuyUpgrade = Remotes:WaitForChild("BuyUpgrade")
+local GetUpgradeState = Remotes:WaitForChild("GetUpgradeState")
+local leaderstats = Player:WaitForChild("leaderstats")
+local Cash = leaderstats:WaitForChild("Cash")
+local RebirthsStat = leaderstats:WaitForChild("Rebirths")
+
+-- Cache dos upgrades disponiveis (ordenados por layoutOrder)
+local UpgradeList = {}
+for name, data in pairs(Upgrades) do
+    table.insert(UpgradeList, {
+        name = name,
+        data = data,
+        layoutOrder = data.layoutOrder or 0,
+        baseCost = data.baseCost or 1,
+        costGrowth = data.CostGrowth or 1,
+        rebirthReq = data.Rebirth or 0,
+        cps = data.CPS or 0,
+        cashPerClick = data.CashPerClick or 0,
+    })
+end
+table.sort(UpgradeList, function(a, b) return a.layoutOrder < b.layoutOrder end)
+
+-- Nomes dos upgrades para UI
+local UpgradeNames = {}
+for _, u in ipairs(UpgradeList) do
+    table.insert(UpgradeNames, u.name)
+end
+
+-- Estado dos niveis (atualizado via GetUpgradeState)
+local UpgradeLevels = {}
+local function FetchState()
+    local ok, state = pcall(function()
+        return GetUpgradeState:InvokeServer()
+    end)
+    if ok and type(state) == "table" and state.levels then
+        UpgradeLevels = state.levels or {}
+    end
+end
+FetchState()
+
+-- Calculo de custo (mesma formula do jogo)
+local function GetUpgradeCost(upgradeName, currentLevel)
+    local info = Upgrades[upgradeName]
+    if not info then return math.huge end
+    local base = info.baseCost or 1
+    local growth = info.CostGrowth or 1
+    local cost = base * (growth ^ currentLevel)
+    -- Aplica desconto do brainrot equipado
+    if state and state.equippedBrainrot then
+        local CharacterData = require(Modules:WaitForChild("CharacterData"))
+        local charData = CharacterData.Characters[state.equippedBrainrot]
+        if charData then
+            local attrs = charData.Attributes or charData
+            if attrs then
+                local discount = attrs["Upgrade Costs"]
+                if type(discount) == "number" and discount > 0 then
+                    cost = cost * (1 - discount / 100)
+                end
+            end
+        end
+    end
+    if cost < 1 then cost = 1 end
+    return math.floor(cost + 0.5)
+end
+
+-- Custo total para comprar N niveis
+local function GetBulkCost(upgradeName, currentLevel, amount)
+    local sum = 0
+    for i = 0, amount - 1 do
+        local c = GetUpgradeCost(upgradeName, currentLevel + i)
+        if c == math.huge or c <= 0 then break end
+        sum = sum + c
+    end
+    return sum
+end
+
+-- Max buy: quantos niveis da pra comprar com o cash atual
+local function GetMaxBuyCount(upgradeName, currentLevel, maxCash)
+    local count = 0
+    local sum = 0
+    for i = 1, 500 do
+        local c = GetUpgradeCost(upgradeName, currentLevel + i - 1)
+        if c == math.huge or c <= 0 then break end
+        if sum + c > maxCash then break end
+        sum = sum + c
+        count = count + 1
+    end
+    return count, sum
+end
+
+-- Compra um upgrade
+local function TryBuyUpgrade(upgradeName, amount)
+    local ok, result = pcall(function()
+        return BuyUpgrade:InvokeServer(upgradeName, amount or 1)
+    end)
+    if ok and type(result) == "table" and result.success then
+        if result.newLevel then
+            UpgradeLevels[upgradeName] = result.newLevel
+        end
+        return true, result
+    end
+    return false, result
+end
+
+-- ===================== ESTADO GLOBAL FLOOD =====================
+local Times        = 10
+local Speed        = 0.05
+local BurstDelay   = 1.0
+local Looping      = false
+local Running      = false
+
+-- ESTADO AUTO BUY
+local AutoBuyEnabled = false
+local AutoBuyRunning = false
+local AutoBuyInterval = 0.5
+local AutoBuyBuyTimes = 1  -- 1=x1, 10=x10, 100=x100, 500=x500
+local AutoBuyPrioritize = "CPS"  -- "CPS" | "Cheapest" | "BestValue"
+local AutoBuySelectedOnly = false
+local AutoBuySelectedUpgrade = UpgradeNames[1] or ""
+local AutoBuyBlacklist = {}
+local AutoBuyLog = {}
+
+local function AddLog(msg)
+    local time = os.date("%H:%M:%S")
+    table.insert(AutoBuyLog, "[" .. time .. "] " .. msg)
+    if #AutoBuyLog > 50 then
+        table.remove(AutoBuyLog, 1)
+    end
+end
 
 -- ===================== FILA DE EXECUCAO (HEARTBEAT) =====================
--- Em vez de usar task.wait (que trava), usamos Heartbeat para
--- distribuir as chamadas ao longo dos frames. O jogo continua
--- rodando a 60fps suave.
-
 local Queue = {
-    pending   = 0,    -- quantas chamadas faltam disparar
-    total     = 0,    -- total original da rajada
-    delay     = 0,    -- delay entre chamadas (segundos)
-    elapsed   = 0,    -- tempo acumulado desde o ultimo disparo
-    timestamp = 0,    -- tick() da ultima chamada
-    maxPerFrame = 5,  -- max chamadas por frame (evita pico)
-    mode      = "idle", -- idle | sending | delayInterval | cooldown
-    cooldown  = 0,    -- tempo restante de cooldown entre rajadas
-    nextBatch = 0,    -- quantas disparar no proximo heartbeat
+    pending   = 0,
+    total     = 0,
+    delay     = 0,
+    elapsed   = 0,
+    timestamp = 0,
+    maxPerFrame = 5,
+    mode      = "idle",
+    cooldown  = 0,
+    nextBatch = 0,
 }
 
--- Reseta a fila
 local function ResetQueue()
     Queue.pending   = 0
     Queue.total     = 0
@@ -73,7 +198,6 @@ local function ResetQueue()
     Queue.nextBatch = 0
 end
 
--- Inicia uma nova rajada na fila
 local function QueueBurst(quantidade, delay)
     Queue.pending   = quantidade
     Queue.total     = quantidade
@@ -84,175 +208,177 @@ local function QueueBurst(quantidade, delay)
     Running = true
 end
 
--- Heartbeat: processa a fila a cada frame (sem travar)
-RunService.Heartbeat:Connect(function(dt)
-    if Queue.mode == "idle" then
-        if AutoBuyEnabled then
-            tryAutoBuy()
-        end
-        return end
-
-    -- Modo: enviando chamadas
-    if Queue.mode == "sending" then
-        local now = tick()
-        local delta = now - Queue.timestamp
-
-        -- Calcula quantas chamadas devem ser disparadas com base
-        -- no tempo passado e no delay configurado
-        if Queue.delay > 0 then
-            Queue.elapsed = Queue.elapsed + dt
-            local expected = math.floor(Queue.elapsed / Queue.delay)
-            if expected > Queue.total - (Queue.total - Queue.pending) then
-                Queue.nextBatch = expected - (Queue.total - Queue.pending)
-            else
-                Queue.nextBatch = 1
-            end
-        else
-            -- delay = 0: dispara tudo no limite do maxPerFrame
-            Queue.nextBatch = math.min(Queue.pending, Queue.maxPerFrame)
-        end
-
-        -- Limita ao maxPorFrame para nao pesar
-        if Queue.nextBatch > Queue.maxPerFrame then
-            Queue.nextBatch = Queue.maxPerFrame
-        end
-        if Queue.nextBatch > Queue.pending then
-            Queue.nextBatch = Queue.pending
-        end
-
-        -- Dispara o batch
-        for _ = 1, Queue.nextBatch do
-            FireOnce()
-        end
-        Queue.pending = Queue.pending - Queue.nextBatch
-        Queue.timestamp = now
-
-        -- Se acabou, vai pra cooldown
-        if Queue.pending <= 0 then
-            Queue.mode = "cooldown"
-            Queue.cooldown = 0.05  -- pausa minima entre rajadas
-            Running = false
-
-            -- Se esta em looping, agenda proxima rajada
-            if Looping then
-                Queue.cooldown = BurstDelay
-                Queue.mode = "cooldown"
-            end
-        end
-        return
-    end
-
-    -- Modo: cooldown entre rajadas
-    if Queue.mode == "cooldown" then
-        Queue.cooldown = Queue.cooldown - dt
-        if Queue.cooldown <= 0 then
-            if Looping then
-                QueueBurst(Times, Speed)
-            else
-                Queue.mode = "idle"
-            end
-        end
-        return
-    end
-end)
-
--- ===================== AUTO-BUY SYSTEM =====================
-local Modules = RS:FindFirstChild("Modules")
-local Upgrades = Modules and require(Modules:FindFirstChild("Upgrades"))
-local SharedFunctions = Modules and require(Modules:FindFirstChild("SharedFunctions"))
-local BuyUpgrade = RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("BuyUpgrade")
-local CharacterData = Modules and require(Modules:FindFirstChild("CharacterData"))
-local Rebirths = require(Modules and Modules:FindFirstChild("Rebirths"))
-
-local AutoBuyEnabled = false
-local AutoBuyMinCash = 1000
-local PlayerData = {
-    Cash = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Cash"),
-    Rebirths = (Player and Player:FindFirstChild("leaderstats")) and Player.leaderstats:FindFirstChild("Rebirths")
+-- ===================== AUTO BUY ENGINE =====================
+local AutoBuyQueue = {
+    pending   = 0,
+    delay     = 0,
+    elapsed   = 0,
+    mode      = "idle",
 }
 
-local function getCurrentMultiplier()
-    local mult = 1
-    if Rebirths and PlayerData.Rebirths then
-        local reb = Rebirths[PlayerData.Rebirths.Value]
-        if reb and reb.Unlocks and reb.Unlocks.Multiplier then
-            mult = mult * reb.Unlocks.Multiplier
-        end
-    end
-    if CharacterData and PlayerData.Cash then
-        local char = CharacterData.Characters[PlayerData.Cash]
-        if char and char.Attributes then
-            local cm = char.Attributes["Cash Multiplier"]
-            if cm then mult = mult * cm end
-        end
-    end
-    return mult
+local function ResetAutoBuyQueue()
+    AutoBuyQueue.pending = 0
+    AutoBuyQueue.delay   = 0
+    AutoBuyQueue.elapsed = 0
+    AutoBuyQueue.mode    = "idle"
 end
 
-local function getUpgradeDiscount()
-    if not CharacterData or not PlayerData.Cash then return 0 end
-    local char = CharacterData.Characters[PlayerData.Cash]
-    local attrs = char and char.Attributes
-    if not attrs then return 0 end
-    local disc = attrs["Upgrade Costs"]
-    return typeof(disc) == "number" and disc or 0
-end
+-- Decide qual upgrade comprar e executa
+local function AutoBuyTick()
+    if not AutoBuyEnabled then return end
+    if AutoBuyRunning then return end
 
-local function getUpgradeCost(upgradeName, level)
-    if not Upgrades or not Upgrades[upgradeName] then return math.huge end
-    local upg = Upgrades[upgradeName]
-    local cost = (upg.baseCost or 1) * (upg.CostGrowth or 1) ^ level
-    local disc = getUpgradeDiscount()
-    if disc > 0 then cost = cost * (1 - disc / 100) end
-    return math.floor(math.max(1, cost))
-end
+    FetchState()
 
-local function getPlayerLevels()
-    local levels = {}
-    if not PlayerData.Cash then return levels end
-    local guiEvents = Modules and require(Modules:FindFirstChild("GuiEvents"))
-    return levels
-end
+    local cashVal = Cash.Value or 0
+    local rebirthsVal = RebirthsStat.Value or 0
 
-local function tryAutoBuy()
-    if not AutoBuyEnabled or not BuyUpgrade or not Upgrades or not PlayerData.Cash then return end
-    local cash = PlayerData.Cash.Value
-    local currentMult = getCurrentMultiplier()
-    for upgradeName, upg in pairs(Upgrades) do
-        if upg.Rebirth and PlayerData.Rebirths and PlayerData.Rebirths.Value >= upg.Rebirth then
-            local level = 0
-            local cost = getUpgradeCost(upgradeName, level)
-            if cash >= cost then
-                local ok, result = pcall(function()
-                    return BuyUpgrade:InvokeServer(upgradeName, 1)
-                end)
-                if ok and result and result.success then
-                    cash = cash - (result.newPrice or cost)
-                    PlayerData.Cash.Value = cash
-                    return
+    local targets = {}
+
+    for _, u in ipairs(UpgradeList) do
+        if u.rebirthReq <= rebirthsVal then
+            local isBlacklisted = false
+            for _, bl in ipairs(AutoBuyBlacklist) do
+                if bl == u.name then isBlacklisted = true; break end
+            end
+            if not isBlacklisted then
+                if AutoBuySelectedOnly then
+                    if u.name == AutoBuySelectedUpgrade then
+                        table.insert(targets, u)
+                    end
+                else
+                    table.insert(targets, u)
                 end
             end
         end
     end
-end
 
--- ===================== FUNCAO PUBLICA: SEND BURST =====================
+    if #targets == 0 then return end
 
-function SendBurst(quantidade, delay, paralelo)
-    if Running and not Looping then
-        return  -- ignora se ja tem algo rodando (exceto loop)
+    -- Ordena por prioridade
+    if AutoBuyPrioritize == "CPS" then
+        table.sort(targets, function(a, b)
+            local aEff = (a.cashPerClick > 0 and a.cashPerClick or a.cps) / math.max(GetUpgradeCost(a.name, UpgradeLevels[a.name] or 0), 1)
+            local bEff = (b.cashPerClick > 0 and b.cashPerClick or b.cps) / math.max(GetUpgradeCost(b.name, UpgradeLevels[b.name] or 0), 1)
+            return aEff > bEff
+        end)
+    elseif AutoBuyPrioritize == "Cheapest" then
+        table.sort(targets, function(a, b)
+            local aCost = GetUpgradeCost(a.name, UpgradeLevels[a.name] or 0)
+            local bCost = GetUpgradeCost(b.name, UpgradeLevels[b.name] or 0)
+            return aCost < bCost
+        end)
+    elseif AutoBuyPrioritize == "BestValue" then
+        table.sort(targets, function(a, b)
+            local aCost = GetUpgradeCost(a.name, UpgradeLevels[a.name] or 0)
+            local bCost = GetUpgradeCost(b.name, UpgradeLevels[b.name] or 0)
+            local aEff = (a.cashPerClick > 0 and a.cashPerClick or a.cps) / math.max(aCost, 1)
+            local bEff = (b.cashPerClick > 0 and b.cashPerClick or b.cps) / math.max(bCost, 1)
+            return aEff > bEff
+        end)
     end
 
+    -- Tenta comprar o melhor alvo
+    for _, target in ipairs(targets) do
+        local level = UpgradeLevels[target.name] or 0
+        local cost = GetUpgradeCost(target.name, level)
+
+        if cost <= cashVal then
+            local amount = AutoBuyBuyTimes
+
+            -- Se buy times excede o cash, cai para o maximo possivel
+            local bulkCost = GetBulkCost(target.name, level, amount)
+            if bulkCost > cashVal then
+                -- Tenta comprar pelo menos 1
+                if cost <= cashVal then
+                    amount = 1
+                else
+                    continue
+                end
+            end
+
+            AutoBuyRunning = true
+            local success, result = TryBuyUpgrade(target.name, amount)
+            if success then
+                local bought = (result and result.boughtLevels) or amount
+                local itemType = target.cps > 0 and "CPS" or "Click"
+                AddLog("SAIU! " .. target.name .. " x" .. tostring(bought) .. " (" .. itemType .. " $" .. tostring(cost) .. ")")
+            else
+                AddLog("ERRO: " .. target.name .. " - " .. tostring(result and result.message or "falha"))
+            end
+            AutoBuyRunning = false
+            return -- Compra um por tick para nao spammar
+        end
+    end
+end
+
+-- ===================== HEARTBEAT UNIFICADO =====================
+RunService.Heartbeat:Connect(function(dt)
+    -- Processa fila de flood
+    if Queue.mode ~= "idle" then
+        if Queue.mode == "sending" then
+            local now = tick()
+            if Queue.delay > 0 then
+                Queue.elapsed = Queue.elapsed + dt
+                local expected = math.floor(Queue.elapsed / Queue.delay)
+                if expected > Queue.total - (Queue.total - Queue.pending) then
+                    Queue.nextBatch = expected - (Queue.total - Queue.pending)
+                else
+                    Queue.nextBatch = 1
+                end
+            else
+                Queue.nextBatch = math.min(Queue.pending, Queue.maxPerFrame)
+            end
+
+            if Queue.nextBatch > Queue.maxPerFrame then Queue.nextBatch = Queue.maxPerFrame end
+            if Queue.nextBatch > Queue.pending then Queue.nextBatch = Queue.pending end
+
+            for _ = 1, Queue.nextBatch do FireOnce() end
+            Queue.pending = Queue.pending - Queue.nextBatch
+            Queue.timestamp = now
+
+            if Queue.pending <= 0 then
+                Queue.mode = "cooldown"
+                Queue.cooldown = 0.05
+                Running = false
+                if Looping then
+                    Queue.cooldown = BurstDelay
+                end
+            end
+            return
+        end
+
+        if Queue.mode == "cooldown" then
+            Queue.cooldown = Queue.cooldown - dt
+            if Queue.cooldown <= 0 then
+                if Looping then
+                    QueueBurst(Times, Speed)
+                else
+                    Queue.mode = "idle"
+                end
+            end
+            return
+        end
+    end
+
+    -- Processa auto buy
+    if AutoBuyEnabled then
+        AutoBuyQueue.elapsed = AutoBuyQueue.elapsed + dt
+        if AutoBuyQueue.elapsed >= AutoBuyInterval then
+            AutoBuyQueue.elapsed = 0
+            AutoBuyTick()
+        end
+    end
+end)
+
+function SendBurst(quantidade, delay, paralelo)
+    if Running and not Looping then return end
     if paralelo then
-        -- Modo paralelo otimizado: dispara em lotes por frame
         QueueBurst(quantidade, 0)
     else
-        -- Modo sequencial: respeita o delay via Heartbeat
         QueueBurst(quantidade, delay)
     end
 end
-
--- ===================== DIAGNOSTICO LEVE =====================
 
 function DiagnoseClickBrainrot()
     local lines = {}
@@ -271,44 +397,40 @@ function DiagnoseClickBrainrot()
         table.insert(lines, "Remotes: PASTA AUSENTE")
     end
 
-    -- Teste unico silencioso
     local ok = pcall(FireOnce)
     table.insert(lines, "FireServer: " .. (ok and "OK" or "FALHOU"))
+    table.insert(lines, "Upgrades: " .. #UpgradeList .. " disponiveis")
 
-    local text = table.concat(lines, " | ")
     print("===== DIAGNOSTICO CBROT =====")
     for _, l in ipairs(lines) do print("[CBRot]", l) end
-    Rayfield:Notify({Title="ClickBrainrot", Content=text, Duration=8})
+    Rayfield:Notify({Title="ClickBrainrot v3", Content=table.concat(lines, " | "), Duration=8})
 end
 
--- ===================== CARREGA RAYFIELD (DEPOIS DAS FUNCOES) =====================
+-- ===================== CARREGA RAYFIELD =====================
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Window = Rayfield:CreateWindow({
-    Name = "ClickBrainrot v2",
+    Name = "ClickBrainrot v3",
     LoadingTitle = "Carregando...",
-    LoadingSubtitle = "Engine otimizada (zero lag)",
+    LoadingSubtitle = "Flood + Auto Buy",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = "ClickBrainrot",
-        FileName = "Config"
+        FileName = "ConfigV3"
     },
-    Discord = {
-        Enabled = false,
-        Invite = "noinvite",
-        RememberJoins = true
-    },
+    Discord = { Enabled = false, Invite = "noinvite", RememberJoins = true },
     KeySystem = false,
 })
 
 -- ===================== ABAS =====================
-local TabFlood = Window:CreateTab("Flood", 4483362458)
-local TabInfo  = Window:CreateTab("Info",  4483362458)
+local TabFlood  = Window:CreateTab("Flood", 4483362458)
+local TabAutoBuy = Window:CreateTab("Auto Buy", 4483362458)
+local TabInfo   = Window:CreateTab("Info", 4483362458)
 
--- Variaveis para os labels de status (atualizados sem recriar)
-local StatusVezes   = "10x"
-local StatusSpeed   = "0.05s"
-local StatusMode    = "Sequencial"
+-- ===================== STATUS VARS =====================
+local StatusVezes = "10x"
+local StatusSpeed = "0.05s"
+local StatusMode  = "Sequencial"
 
 -- =====================================================================
 -- ======================== ABA: FLOOD =================================
@@ -349,9 +471,7 @@ TabFlood:CreateSlider({
     Suffix = "s",
     CurrentValue = 1.0,
     Flag = "SldBurst",
-    Callback = function(v)
-        BurstDelay = v
-    end,
+    Callback = function(v) BurstDelay = v end,
 })
 
 TabFlood:CreateToggle({
@@ -359,35 +479,7 @@ TabFlood:CreateToggle({
     CurrentValue = false,
     Flag = "TglTurbo",
     Callback = function(v)
-        -- Quando turbo ligado, o Speed slider vira o maxPerFrame
-        if v then
-            StatusMode = "TURBO"
-        else
-            StatusMode = "Sequencial"
-        end
-    end,
-})
-
-local SecAutoBuy = TabFlood:CreateSection("Auto-Buy")
-
-TabFlood:CreateToggle({
-    Name = "Auto-Buy Upgrades",
-    CurrentValue = false,
-    Flag = "TglAutoBuy",
-    Callback = function(v)
-        AutoBuyEnabled = v
-    end,
-})
-
-TabFlood:CreateSlider({
-    Name = "Min Cash para Auto-Buy",
-    Range = {0, 100000},
-    Increment = 100,
-    Suffix = "$",
-    CurrentValue = 1000,
-    Flag = "SldMinCash",
-    Callback = function(v)
-        AutoBuyMinCash = math.floor(v)
+        StatusMode = v and "TURBO" or "Sequencial"
     end,
 })
 
@@ -400,14 +492,8 @@ TabFlood:CreateToggle({
     Callback = function(v)
         Looping = v
         if v then
-            if not Running then
-                QueueBurst(Times, Speed)
-            end
-            Rayfield:Notify({
-                Title = "Loop",
-                Content = Times .. "x a cada " .. BurstDelay .. "s",
-                Duration = 2,
-            })
+            if not Running then QueueBurst(Times, Speed) end
+            Rayfield:Notify({Title="Loop", Content=Times.."x a cada "..BurstDelay.."s", Duration=2})
         else
             ResetQueue()
             Running = false
@@ -435,70 +521,194 @@ TabFlood:CreateButton({
 
 TabFlood:CreateButton({
     Name = "Diagnosticar",
-    Callback = function()
-        task.spawn(DiagnoseClickBrainrot)
-    end,
+    Callback = function() task.spawn(DiagnoseClickBrainrot) end,
 })
 
--- Status ao vivo (atualizado a cada heartbeat via bind)
 local SecStatus = TabFlood:CreateSection("Status")
-local StatusLabel = TabFlood:CreateParagraph("Status",
+TabFlood:CreateParagraph("Status",
     "Vezes: " .. StatusVezes .. "\n"
     .. "Velocidade: " .. StatusSpeed .. "\n"
     .. "Modo: " .. StatusMode
 )
 
 -- =====================================================================
+-- ======================== ABA: AUTO BUY ==============================
+-- =====================================================================
+
+local SecABConfig = TabAutoBuy:CreateSection("Configuracao")
+
+TabAutoBuy:CreateToggle({
+    Name = "Auto Buy Ativo",
+    CurrentValue = false,
+    Flag = "TglAutoBuy",
+    Callback = function(v)
+        AutoBuyEnabled = v
+        if v then
+            FetchState()
+            AddLog("Auto Buy ATIVADO")
+            Rayfield:Notify({Title="Auto Buy", Content="Comprando upgrades automaticamente", Duration=3})
+        else
+            AddLog("Auto Buy DESATIVADO")
+        end
+    end,
+})
+
+TabAutoBuy:CreateSlider({
+    Name = "Intervalo de Compra",
+    Range = {0.1, 5},
+    Increment = 0.1,
+    Suffix = "s",
+    CurrentValue = 0.5,
+    Flag = "SldABInterval",
+    Callback = function(v) AutoBuyInterval = v end,
+})
+
+TabAutoBuy:CreateDropdown({
+    Name = "Quantidade por Compra",
+    Options = {"x1", "x10", "x100", "x500"},
+    CurrentOption = "x1",
+    Flag = "DrpABAmount",
+    Callback = function(v)
+        local n = tonumber(v:match("%d+"))
+        AutoBuyBuyTimes = n or 1
+    end,
+})
+
+TabAutoBuy:CreateDropdown({
+    Name = "Prioridade",
+    Options = {"BestValue", "CPS", "Cheapest"},
+    CurrentOption = "BestValue",
+    Flag = "DrpABPriority",
+    Callback = function(v) AutoBuyPrioritize = v end,
+})
+
+local SecABTarget = TabAutoBuy:CreateSection("Alvo")
+
+TabAutoBuy:CreateToggle({
+    Name = "Comprar Apenas Selecionado",
+    CurrentValue = false,
+    Flag = "TglABSelected",
+    Callback = function(v) AutoBuySelectedOnly = v end,
+})
+
+TabAutoBuy:CreateDropdown({
+    Name = "Upgrade Especifico",
+    Options = UpgradeNames,
+    CurrentOption = {UpgradeNames[1] or ""},
+    Flag = "DrpABUpgrade",
+    Callback = function(v) AutoBuySelectedUpgrade = v end,
+})
+
+local SecABBlacklist = TabAutoBuy:CreateSection("Blacklist (ignorar)")
+
+-- Cria toggles para cada upgrade na blacklist
+for _, u in ipairs(UpgradeList) do
+    TabAutoBuy:CreateToggle({
+        Name = u.name,
+        CurrentValue = false,
+        Flag = "Bl_" .. u.name,
+        Callback = function(v)
+            AutoBuyBlacklist[u.name] = v
+        end,
+    })
+end
+
+local SecABLog = TabAutoBuy:CreateSection("Log de Compras")
+
+TabAutoBuy:CreateButton({
+    Name = "Atualizar Log",
+    Callback = function()
+        local logText = #AutoBuyLog > 0 and table.concat(AutoBuyLog, "\n") or "Nenhuma compra ainda."
+        Rayfield:Notify({Title="Auto Buy Log", Content=logText, Duration=5})
+    end,
+})
+
+TabAutoBuy:CreateButton({
+    Name = "Comprar Tudo (uma vez)",
+    Callback = function()
+        task.spawn(function()
+            FetchState()
+            local cashVal = Cash.Value or 0
+            local rebirthsVal = RebirthsStat.Value or 0
+            local bought = 0
+
+            for _, u in ipairs(UpgradeList) do
+                if u.rebirthReq <= rebirthsVal then
+                    local level = UpgradeLevels[u.name] or 0
+                    local cost = GetUpgradeCost(u.name, level)
+                    if cost <= cashVal then
+                        local ok, result = TryBuyUpgrade(u.name, 1)
+                        if ok then
+                            bought = bought + 1
+                            cashVal = cashVal - cost
+                            task.wait(0.1)
+                        end
+                    end
+                end
+            end
+
+            AddLog("Compra em massa: " .. bought .. " upgrades comprados")
+            Rayfield:Notify({Title="Auto Buy", Content="Comprou " .. bought .. " upgrades", Duration=3})
+        end)
+    end,
+})
+
+TabAutoBuy:CreateButton({
+    Name = "Limpar Log",
+    Callback = function()
+        AutoBuyLog = {}
+        Rayfield:Notify({Title="Auto Buy", Content="Log limpo", Duration=2})
+    end,
+})
+
+-- =====================================================================
 -- ======================== ABA: INFO ==================================
 -- =====================================================================
 
-TabInfo:CreateParagraph("ClickBrainrot v2", [[
-Engine otimizada por frame (RunService.Heartbeat).
+TabInfo:CreateParagraph("ClickBrainrot v3", [[
+Engine otimizada por frame (RunService.Heartbeat) + Auto Buy.
 
-Diferencas da v1:
- - Zero lag: usa Heartbeat em vez de task.wait
- - Frame-budget: max 5 chamadas por frame
- - Fila assincrona: nunca bloqueia o jogo
- - Sem strings/notifications durante a rajada
- - Coleta de lixo minimizada
+Novidades v3:
+ - Auto Buy: compra upgrades automaticamente
+ - Prioridade: BestValue, CPS ou Cheapest
+ - Blacklist: ignore upgrades especificos
+ - Compra em massa com um clique
+ - Log de compras em tempo real
 
 Remote: ReplicatedStorage.Remotes.ClickBrainrot
 Args: { [1] = 1 }
-Metodo: FireServer(unpack(args))
 Efeito: Cash +7 por chamada
 ]])
 
-TabInfo:CreateParagraph("Dados do UltraSpy (Flow #78)", [[
-Confidence: 70% (Remote effect)
-ReplayScore: 100/100 (Verified Action)
-ValuableActionScore: 90/100
+TabInfo:CreateParagraph("Auto Buy - Como Usar", [[
+1. Ative "Auto Buy Ativo"
+2. Escolha a prioridade:
+   - BestValue: melhor custo/beneficio
+   - CPS: prioriza upgrades de CPS
+   - Cheapest: compra o mais barato primeiro
+3. Escolha a quantidade (x1, x10, x100, x500)
+4. Opcional: marque upgrades na Blacklist
+5. Opcional: selecione um upgrade especifico
 
-109 chamadas registradas no lifecycle
-Cash confirmado: +7 por chamada
-AlertLabel.Text / Cash.Text atualizados
+O sistema compra automaticamente quando
+voce tem cash suficiente.
 ]])
 
-TabInfo:CreateParagraph("Como Usar", [[
-1. Ajuste "Vezes" e "Velocidade"
-2. Clique "Enviar Rajada"
-3. Ou ative "Loop Automatico"
-4. Use "PARAR" para emergencia
+TabInfo:CreateParagraph("Upgrades Disponiveis", [[
+]] .. table.concat(UpgradeNames, ", ") .. [[
 
-Modo Turbo: max 5 chamadas por frame
-(ignora o delay, vai o mais rapido possivel
-sem travar o jogo)
+Total: ]] .. tostring(#UpgradeList) .. [[ upgrades
 ]])
 
 TabInfo:CreateParagraph("Aviso", [[
 Nao abuse para nao tomar kick.
 Rate limit do servidor: ~50/s.
-Com delay 0.05s: ~20 chamadas/s (seguro).
-Modo Turbo: limitado a 5/frame = ~300/s a 60fps.
+Auto Buy respeita o intervalo configurado.
 ]])
 
 -- Notificacao inicial
 Rayfield:Notify({
-    Title = "ClickBrainrot v2",
-    Content = "Engine otimizada carregada. Zero lag.",
-    Duration = 3,
+    Title = "ClickBrainrot v3",
+    Content = "Flood + Auto Buy carregados. " .. #UpgradeList .. " upgrades detectados.",
+    Duration = 4,
 })
