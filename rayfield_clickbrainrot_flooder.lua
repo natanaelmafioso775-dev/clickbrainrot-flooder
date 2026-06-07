@@ -52,17 +52,22 @@ local RebirthsStat = leaderstats:WaitForChild("Rebirths")
 
 -- Cache dos upgrades disponiveis (ordenados por layoutOrder)
 local UpgradeList = {}
-for name, data in pairs(Upgrades) do
-    table.insert(UpgradeList, {
-        name = name,
-        data = data,
-        layoutOrder = data.layoutOrder or 0,
-        baseCost = data.baseCost or 1,
-        costGrowth = data.CostGrowth or 1,
-        rebirthReq = data.Rebirth or 0,
-        cps = data.CPS or 0,
-        cashPerClick = data.CashPerClick or 0,
-    })
+local UpgradesOk, UpgradesData = pcall(function() return Upgrades end)
+if UpgradesOk and type(UpgradesData) == "table" then
+    for name, data in pairs(UpgradesData) do
+        if type(data) == "table" then
+            table.insert(UpgradeList, {
+                name = name,
+                data = data,
+                layoutOrder = data.layoutOrder or 0,
+                baseCost = data.baseCost or 1,
+                costGrowth = data.CostGrowth or 1,
+                rebirthReq = data.Rebirth or 0,
+                cps = data.CPS or 0,
+                cashPerClick = data.CashPerClick or 0,
+            })
+        end
+    end
 end
 table.sort(UpgradeList, function(a, b) return a.layoutOrder < b.layoutOrder end)
 
@@ -70,6 +75,11 @@ table.sort(UpgradeList, function(a, b) return a.layoutOrder < b.layoutOrder end)
 local UpgradeNames = {}
 for _, u in ipairs(UpgradeList) do
     table.insert(UpgradeNames, u.name)
+end
+
+-- Fallback se nenhum upgrade foi encontrado
+if #UpgradeNames == 0 then
+    UpgradeNames = {"Nenhum upgrade detectado"}
 end
 
 -- Estado dos niveis (atualizado via GetUpgradeState)
@@ -594,7 +604,7 @@ TabAutoBuy:CreateToggle({
 TabAutoBuy:CreateDropdown({
     Name = "Upgrade Especifico",
     Options = UpgradeNames,
-    CurrentOption = {UpgradeNames[1] or ""},
+    CurrentOption = {UpgradeNames[1]},
     Flag = "DrpABUpgrade",
     Callback = function(v) AutoBuySelectedUpgrade = v end,
 })
@@ -694,11 +704,10 @@ O sistema compra automaticamente quando
 voce tem cash suficiente.
 ]])
 
-TabInfo:CreateParagraph("Upgrades Disponiveis", [[
-]] .. table.concat(UpgradeNames, ", ") .. [[
-
-Total: ]] .. tostring(#UpgradeList) .. [[ upgrades
-]])
+TabInfo:CreateParagraph("Upgrades Disponiveis", #UpgradeList > 0
+    and ("Detectados: " .. table.concat(UpgradeNames, ", ") .. "\n\nTotal: " .. tostring(#UpgradeList) .. " upgrades")
+    or "Nenhum upgrade detectado.\n\nIsso pode acontecer se o jogo ainda nao carregou os dados ou se a estrutura do mudulo for diferente."
+)
 
 TabInfo:CreateParagraph("Aviso", [[
 Nao abuse para nao tomar kick.
